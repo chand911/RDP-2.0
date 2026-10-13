@@ -4,16 +4,16 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet"
+        description: "Tailscale tailnet ID"
         required: true
       ts_api_key:
-        description: "Tailscale API key"
+        description: "Tailscale API access token"
         required: true
       ts_authkey:
         description: "Tailscale auth key"
         required: true
       gh_api_token:
-        description: "GitHub PAT"
+        description: "GitHub classic PAT"
         required: true
       test_mode:
         description: "5-minute test"
@@ -42,7 +42,7 @@ defaults:
 
 env:
   RDP_USER: chand
-  RDP_PASS: Chand@2026!Bullet
+  RDP_PASS: Chand#NewP@ss2026X7!
   TS_HOSTNAME: bullet
 
 jobs:
@@ -100,26 +100,56 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: Enable RDP user + firewall
+      - name: Relax password policy + create RDP user + firewall
         run: |
           $u = "${{ env.RDP_USER }}"
           $p = "${{ env.RDP_PASS }}"
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
 
-          if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            try {
-              New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
-              Write-Host "User $u created"
-            } catch {
-              Write-Warning "New-LocalUser failed: $_"
-              net user $u "$p" /add /y
-            }
-          } else {
-            Set-LocalUser -Name $u -Password $sec -PasswordNeverExpires -ErrorAction SilentlyContinue
-            Enable-LocalUser -Name $u -ErrorAction SilentlyContinue
-            Write-Host "User $u updated"
+          Write-Host "Relaxing password policy..."
+          net accounts /minpwlen:0 /maxpwage:unlimited /minpwage:0 /uniquepw:0 2>&1 | ForEach-Object { Write-Host $_ }
+
+          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
+            Write-Host "Removing existing user $u"
+            Remove-LocalUser -Name $u -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 1
           }
 
+          $sec = ConvertTo-SecureString $p -AsPlainText -Force
+          $created = $false
+
+          try {
+            New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
+            Write-Host "Created via New-LocalUser"
+            $created = $true
+          } catch {
+            Write-Warning "New-LocalUser failed: $_"
+          }
+
+          if (-not $created) {
+            Write-Host "Trying net user..."
+            net user $u "$p" /add /y 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) { $created = $true; Write-Host "Created via net user" }
+          }
+
+          if (-not $created) {
+            Write-Host "Trying wmic..."
+            wmic useraccount create name="$u",password="$p",PasswordExpires=false 2>&1 | ForEach-Object { Write-Host $_ }
+            if ($LASTEXITCODE -eq 0) { $created = $true; Write-Host "Created via wmic" }
+          }
+
+          if (-not $created) {
+            Write-Error "FAILED to create user $u with all methods"
+            exit 1
+          }
+
+          $verify = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
+          if (-not $verify) {
+            Write-Error "User $u not found after creation"
+            exit 1
+          }
+          Write-Host "User $u verified: enabled=$($verify.Enabled)"
+
+          Enable-LocalUser -Name $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group Administrators -Member $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
 
@@ -127,7 +157,11 @@ jobs:
 
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-          Write-Host "RDP user $u ready"
+          Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0 -ErrorAction SilentlyContinue
+
+          $deny = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server").fDenyTSConnections
+          Write-Host "fDenyTSConnections=$deny (0 = RDP enabled)"
+          Write-Host "RDP user $u ready — password length: $($p.Length) chars"
 
       - name: Startup purge
         run: |
@@ -187,6 +221,7 @@ jobs:
 
       - name: Exit purge
         if: always()
+        continue-on-error: true
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
@@ -219,7 +254,6 @@ jobs:
           $uri = "https://api.github.com/repos/$repo/actions/workflows/windows-rdp-tailscale-A.yml/dispatches"
 
           Write-Host "Dispatch URI: $uri"
-          Write-Host "Ref: ${{ github.ref_name }}"
           Write-Host "Next loops: $next"
 
           try {
@@ -229,13 +263,14 @@ jobs:
             } -Uri "https://api.github.com/repos/$repo/actions/workflows"
             $aExists = $wfCheck.workflows | Where-Object { $_.path -match 'windows-rdp-tailscale-A\.yml' }
             if (-not $aExists) {
-              Write-Error "workflow A not found. Available workflows:"
+              Write-Error "workflow A not found. Available:"
               $wfCheck.workflows | ForEach-Object { Write-Host "  $($_.path)" }
               exit 1
             }
-            Write-Host "Found A workflow: $($aExists.path) (id=$($aExists.id))"
+            Write-Host "Found A workflow: $($aExists.path)"
           } catch {
             Write-Error "Failed to list workflows: $_"
+            if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
             exit 1
           }
 
@@ -261,9 +296,6 @@ jobs:
             Write-Host "Dispatch OK"
           } catch {
             Write-Error "Dispatch failed: $($_.Exception.Message)"
-            if ($_.ErrorDetails.Message) {
-              Write-Host "Response:"
-              Write-Host $_.ErrorDetails.Message
-            }
+            if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
             exit 1
           }
