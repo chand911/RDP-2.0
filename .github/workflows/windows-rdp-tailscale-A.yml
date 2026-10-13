@@ -4,27 +4,27 @@ on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet ID (e.g. Tcy5UHDFMx11CNTRL)"
+        description: "Tailscale tailnet (e.g. you@gmail.com)"
         required: true
       ts_api_key:
-        description: "Tailscale API access token (tskey-api-...)"
+        description: "Tailscale API key (device admin, no 'Bearer')"
         required: true
       ts_authkey:
-        description: "Tailscale auth key (tskey-auth-..., reusable+ephemeral)"
+        description: "Tailscale auth key (reusable or ephemeral)"
         required: true
       gh_api_token:
-        description: "GitHub PAT (classic; scopes: repo + workflow)"
+        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
         required: true
       test_mode:
-        description: "5-minute test loop"
+        description: "Run 5-minute test loop"
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime in minutes (355 max)"
+        description: "Runtime in minutes (max 360; capped to 355)"
         required: false
         default: "355"
       loops:
-        description: "Handoffs (0 = infinite, 1 = stop, N = N more)"
+        description: "How many handoffs (0 = infinite)"
         required: false
         default: "0"
 
@@ -50,16 +50,16 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      - name: Resolve inputs
+      - name: 🔧 Resolve inputs (safe)
         id: cfg
         env:
-          RAW_TAILNET: ${{ inputs.ts_tailnet }}
-          RAW_APIKEY:  ${{ inputs.ts_api_key }}
-          RAW_AUTHKEY: ${{ inputs.ts_authkey }}
-          RAW_PAT:     ${{ inputs.gh_api_token }}
-          RAW_TEST:    ${{ inputs.test_mode == true && 'true' || 'false' }}
-          RAW_RUNTIME: ${{ inputs.runtime_minutes || '355' }}
-          RAW_LOOPS:   ${{ inputs.loops || '0' }}
+          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
+          RAW_APIKEY:   ${{ inputs.ts_api_key }}
+          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
+          RAW_PAT:      ${{ inputs.gh_api_token }}
+          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
+          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:    ${{ inputs.loops || '0' }}
         run: |
           function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
 
@@ -75,8 +75,8 @@ jobs:
 
           $runtime = ToIntOr $env:RAW_RUNTIME 355
           if ($isTest) { $runtime = 5 }
+          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
-          if ($runtime -lt 1)    { $runtime = 355 }
 
           $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
@@ -87,10 +87,9 @@ jobs:
           "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
-          "started=$(Get-Date -Format o)" | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "Resolved: test=$isTest runtime=$runtime loops=$loops"
+          Write-Host "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
 
-      - name: Install Tailscale
+      - name: ⚙️ Install Tailscale
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -102,18 +101,21 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: Create RDP user (ADSI direct)
+      - name: 🔐 Create RDP user (ADSI + Administrator fallback)
         run: |
           $u = "${{ env.RDP_USER }}"
           $p = "${{ env.RDP_PASS }}"
 
-          Write-Host "=== Starting user creation for: $u ==="
+          Write-Host "=== Creating RDP user: $u ==="
 
-          # Remove existing user
+          # 1. relax password policy
+          net accounts /minpwlen:0 /maxpwage:unlimited /minpwage:0 /uniquepw:0 2>&1 | ForEach-Object { Write-Host $_ }
+
+          # 2. remove existing user
           try {
             $existing = [ADSI]"WinNT://./$u,user"
             if ($existing.Name) {
-              Write-Host "Removing existing user $u"
+              Write-Host "Removing existing $u"
               ([ADSI]"WinNT://./").Remove($existing.ADsPath)
               Start-Sleep -Seconds 1
             }
@@ -121,98 +123,62 @@ jobs:
 
           $created = $false
 
-          # Method 1: ADSI direct (bypasses password policy)
+          # 3. ADSI direct (bypasses password policy)
           try {
             $comp = [ADSI]"WinNT://./"
-            $user = $comp.Create("User", $u)
-            $user.SetInfo()
-            $user.SetPassword($p)
-            $user.SetInfo()
+            $usr = $comp.Create("User", $u)
+            $usr.SetInfo()
+            $usr.SetPassword($p)
+            $usr.SetInfo()
             Write-Host "[OK] Created via ADSI direct"
             $created = $true
           } catch {
-            Write-Warning "ADSI direct failed: $_"
+            Write-Warning "ADSI failed: $_"
           }
 
-          # Method 2: net user with /passwordreq:no
+          # 4. net user fallback
           if (-not $created) {
-            Write-Host "Trying net user /passwordreq:no..."
-            $out = net user $u "$p" /add /y /passwordreq:no 2>&1
-            $out | ForEach-Object { Write-Host $_ }
-            $check = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
-            if ($check) {
+            Write-Host "Trying net user..."
+            net user $u "$p" /add /y 2>&1 | ForEach-Object { Write-Host $_ }
+            if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
               Write-Host "[OK] Created via net user"
               $created = $true
             }
           }
 
-          # Method 3: secedit policy override then New-LocalUser
+          # 5. Administrator fallback (built-in, always works)
           if (-not $created) {
-            Write-Host "Applying secedit policy override..."
-            $inf = @"
-[Unicode]
-Unicode=yes
-[System Access]
-MinimumPasswordLength = 0
-PasswordComplexity = 0
-PasswordHistorySize = 0
-MaximumPasswordAge = -1
-MinimumPasswordAge = 0
-[Version]
-signature="`$CHICAGO`$"
-Revision=1
-"@
-            $infPath = "$env:TEMP\pwpol.inf"
-            $dbPath  = "$env:TEMP\pwpol.sdb"
-            $inf | Out-File -Encoding Unicode $infPath
-            secedit /configure /db $dbPath /cfg $infPath /areas SECURITYPOLICY 2>&1 | ForEach-Object { Write-Host $_ }
-            gpupdate /force 2>&1 | Out-Null
-            Start-Sleep -Seconds 2
-
-            try {
-              $sec = ConvertTo-SecureString $p -AsPlainText -Force
-              New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
-              Write-Host "[OK] Created via New-LocalUser after secedit"
-              $created = $true
-            } catch {
-              Write-Warning "New-LocalUser still failed: $_"
-            }
+            Write-Host "Falling back to built-in Administrator"
+            net user Administrator "$p" 2>&1 | ForEach-Object { Write-Host $_ }
+            net user Administrator /active:yes 2>&1 | ForEach-Object { Write-Host $_ }
+            $u = "Administrator"
+            $created = $true
           }
 
-          if (-not $created) {
-            Write-Error "FAILED to create user $u with all 3 methods"
-            exit 1
-          }
-
-          # Verify
+          # 6. verify
           $verify = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
-          if (-not $verify) {
-            Write-Error "User $u not found after creation"
-            exit 1
-          }
+          if (-not $verify) { Write-Error "User $u not found"; exit 1 }
           Write-Host "[OK] User $u verified — enabled=$($verify.Enabled)"
 
-          # Enable + groups
           Enable-LocalUser -Name $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group Administrators -Member $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
-          Write-Host "[OK] User $u added to Administrators + Remote Desktop Users"
 
-          # Password never expires
           wmic useraccount where "name='$u'" set PasswordExpires=false 2>$null | Out-Null
 
-          # Enable RDP
+          # 7. RDP enable
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
-
-          # Disable NLA
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0 -ErrorAction SilentlyContinue
 
           $deny = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server").fDenyTSConnections
-          Write-Host "[OK] fDenyTSConnections=$deny (0 = RDP enabled)"
-          Write-Host "=== RDP ready: user=$u passLen=$($p.Length) ==="
+          Write-Host "fDenyTSConnections=$deny"
 
-      - name: Startup purge (devices containing 'bullet')
+          # save final username for summary
+          "final_user=$u" | Out-File -Append $env:GITHUB_OUTPUT
+          Write-Host "=== RDP READY: USER=$u PASS=$p ==="
+
+      - name: 🧹 PURGE any devices containing 'bullet' (startup)
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
@@ -231,7 +197,7 @@ Revision=1
             }
           } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: Tailscale up (hostname=bullet)
+      - name: 🔗 Tailscale up
         id: up
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
@@ -240,9 +206,7 @@ Revision=1
           Start-Sleep -Seconds 3
 
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
-          if (-not $ip4) {
-            Write-Error "Tailscale failed to get IP"; exit 1
-          }
+          if (-not $ip4) { Write-Error "Tailscale failed to get IP"; exit 1 }
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
           $derp = $status.Self.DERP
@@ -250,17 +214,9 @@ Revision=1
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
 
-          @"
-          ### RDP (A) — ${{ steps.cfg.outputs.started }}
-          Host: $env:TS_HOSTNAME
-          IPv4: $ip4
-          MagicDNS: $fqdn
-          DERP: $derp
-          User: $env:RDP_USER
-          Pass: $env:RDP_PASS
-          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: ${{ steps.cfg.outputs.final_user }}`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: Keep alive
+      - name: ⏳ Keep alive
         run: |
           $mins=[int]"${{ steps.cfg.outputs.runtime }}"
           $end=(Get-Date).AddMinutes($mins)
@@ -270,7 +226,7 @@ Revision=1
             Start-Sleep -Seconds 60
           }
 
-      - name: Exit purge (devices containing 'bullet')
+      - name: 🧹 PURGE any devices containing 'bullet' (exit)
         if: always()
         continue-on-error: true
         run: |
@@ -291,7 +247,7 @@ Revision=1
             }
           } catch { Write-Warning "Exit purge failed: $_" }
 
-      - name: Dispatch workflow B
+      - name: 🔁 Dispatch workflow B
         if: always()
         env:
           GH_TOKEN: ${{ steps.cfg.outputs.pat }}
@@ -305,7 +261,6 @@ Revision=1
           $uri = "https://api.github.com/repos/$repo/actions/workflows/windows-rdp-tailscale-B.yml/dispatches"
 
           Write-Host "Dispatch URI: $uri"
-          Write-Host "Ref: ${{ github.ref_name }}"
           Write-Host "Next loops: $next"
 
           try {
@@ -315,18 +270,18 @@ Revision=1
             } -Uri "https://api.github.com/repos/$repo/actions/workflows"
             $bExists = $wfCheck.workflows | Where-Object { $_.path -match 'windows-rdp-tailscale-B\.yml' }
             if (-not $bExists) {
-              Write-Error "workflow B not found in repo. Available workflows:"
+              Write-Error "workflow B not found. Available workflows:"
               $wfCheck.workflows | ForEach-Object { Write-Host "  $($_.path)" }
               exit 1
             }
-            Write-Host "Found B workflow: $($bExists.path) (id=$($bExists.id))"
+            Write-Host "Found B workflow: $($bExists.path)"
           } catch {
             Write-Error "Failed to list workflows: $_"
             if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
             exit 1
           }
 
-          $body = @{
+          $body=@{
             ref    = "${{ github.ref_name }}"
             inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
@@ -348,6 +303,9 @@ Revision=1
             Write-Host "[OK] Dispatch B successful"
           } catch {
             Write-Error "Dispatch failed: $($_.Exception.Message)"
-            if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
+            if ($_.ErrorDetails.Message) {
+              Write-Host "Response:"
+              Write-Host $_.ErrorDetails.Message
+            }
             exit 1
           }
