@@ -42,7 +42,7 @@ defaults:
 
 env:
   RDP_USER: chand
-  RDP_PASS: 1
+  RDP_PASS: Chand@2026!Bullet
   TS_HOSTNAME: bullet
 
 jobs:
@@ -102,18 +102,32 @@ jobs:
 
       - name: Enable RDP user + firewall
         run: |
-          $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
+          $u = "${{ env.RDP_USER }}"
+          $p = "${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
+
           if (-not (Get-LocalUser -Name $u -ErrorAction SilentlyContinue)) {
-            New-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Add-LocalGroupMember -Group Administrators -Member $u
-            Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u
+            try {
+              New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
+              Write-Host "User $u created"
+            } catch {
+              Write-Warning "New-LocalUser failed: $_"
+              net user $u "$p" /add /y
+            }
           } else {
-            Set-LocalUser -Name $u -Password $sec -AccountNeverExpires
-            Enable-LocalUser -Name $u
+            Set-LocalUser -Name $u -Password $sec -PasswordNeverExpires -ErrorAction SilentlyContinue
+            Enable-LocalUser -Name $u -ErrorAction SilentlyContinue
+            Write-Host "User $u updated"
           }
+
+          Add-LocalGroupMember -Group Administrators -Member $u -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+
+          wmic useraccount where "name='$u'" set PasswordExpires=false 2>$null | Out-Null
+
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
+          Write-Host "RDP user $u ready"
 
       - name: Startup purge
         run: |
@@ -193,13 +207,39 @@ jobs:
 
       - name: Dispatch workflow A
         if: always()
+        env:
+          GH_TOKEN: ${{ steps.cfg.outputs.pat }}
         run: |
           $loops=[int]"${{ steps.cfg.outputs.loops }}"
           if ($loops -eq 1) { Write-Host "Loops finished; not dispatching."; exit 0 }
           if ($loops -gt 1) { $next=$loops-1 } else { $next=0 }
 
-          $token="${{ steps.cfg.outputs.pat }}"
-          $body=@{
+          $repo = "${{ github.repository }}"
+          $token = "$env:GH_TOKEN"
+          $uri = "https://api.github.com/repos/$repo/actions/workflows/windows-rdp-tailscale-A.yml/dispatches"
+
+          Write-Host "Dispatch URI: $uri"
+          Write-Host "Ref: ${{ github.ref_name }}"
+          Write-Host "Next loops: $next"
+
+          try {
+            $wfCheck = Invoke-RestMethod -Method GET -Headers @{
+              Authorization = "Bearer $token"
+              Accept = "application/vnd.github+json"
+            } -Uri "https://api.github.com/repos/$repo/actions/workflows"
+            $aExists = $wfCheck.workflows | Where-Object { $_.path -match 'windows-rdp-tailscale-A\.yml' }
+            if (-not $aExists) {
+              Write-Error "workflow A not found. Available workflows:"
+              $wfCheck.workflows | ForEach-Object { Write-Host "  $($_.path)" }
+              exit 1
+            }
+            Write-Host "Found A workflow: $($aExists.path) (id=$($aExists.id))"
+          } catch {
+            Write-Error "Failed to list workflows: $_"
+            exit 1
+          }
+
+          $body = @{
             ref    = "${{ github.ref_name }}"
             inputs = @{
               ts_tailnet      = "${{ steps.cfg.outputs.tailnet }}"
@@ -212,8 +252,18 @@ jobs:
             }
           } | ConvertTo-Json -Depth 5
 
-          Write-Host "Dispatching A (next loops=$next)..."
-          Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" `
-            -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
-            -Body $body
+          try {
+            Invoke-RestMethod -Method POST `
+              -Uri $uri `
+              -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json" } `
+              -Body $body `
+              -ErrorAction Stop
+            Write-Host "Dispatch OK"
+          } catch {
+            Write-Error "Dispatch failed: $($_.Exception.Message)"
+            if ($_.ErrorDetails.Message) {
+              Write-Host "Response:"
+              Write-Host $_.ErrorDetails.Message
+            }
+            exit 1
+          }
