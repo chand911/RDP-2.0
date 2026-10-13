@@ -102,88 +102,115 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: Relax password policy + create RDP user + firewall
+      - name: Create RDP user (ADSI direct)
         run: |
           $u = "${{ env.RDP_USER }}"
           $p = "${{ env.RDP_PASS }}"
 
-          # 1. Windows password policy relax (the root fix)
-          Write-Host "Relaxing password policy..."
-          net accounts /minpwlen:0 /maxpwage:unlimited /minpwage:0 /uniquepw:0 2>&1 | ForEach-Object { Write-Host $_ }
+          Write-Host "=== Starting user creation for: $u ==="
 
-          # 2. Remove existing user if present
-          if (Get-LocalUser -Name $u -ErrorAction SilentlyContinue) {
-            Write-Host "Removing existing user $u"
-            Remove-LocalUser -Name $u -ErrorAction SilentlyContinue
-            Start-Sleep -Seconds 1
-          }
+          # Remove existing user
+          try {
+            $existing = [ADSI]"WinNT://./$u,user"
+            if ($existing.Name) {
+              Write-Host "Removing existing user $u"
+              ([ADSI]"WinNT://./").Remove($existing.ADsPath)
+              Start-Sleep -Seconds 1
+            }
+          } catch {}
 
-          # 3. Create user - three fallbacks
-          $sec = ConvertTo-SecureString $p -AsPlainText -Force
           $created = $false
 
-          # try New-LocalUser
+          # Method 1: ADSI direct (bypasses password policy)
           try {
-            New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
-            Write-Host "Created via New-LocalUser"
+            $comp = [ADSI]"WinNT://./"
+            $user = $comp.Create("User", $u)
+            $user.SetInfo()
+            $user.SetPassword($p)
+            $user.SetInfo()
+            Write-Host "[OK] Created via ADSI direct"
             $created = $true
           } catch {
-            Write-Warning "New-LocalUser failed: $_"
+            Write-Warning "ADSI direct failed: $_"
           }
 
-          # try net user
+          # Method 2: net user with /passwordreq:no
           if (-not $created) {
-            Write-Host "Trying net user..."
-            net user $u "$p" /add /y 2>&1 | ForEach-Object { Write-Host $_ }
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "Created via net user"
+            Write-Host "Trying net user /passwordreq:no..."
+            $out = net user $u "$p" /add /y /passwordreq:no 2>&1
+            $out | ForEach-Object { Write-Host $_ }
+            $check = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
+            if ($check) {
+              Write-Host "[OK] Created via net user"
               $created = $true
             }
           }
 
-          # try wmic
+          # Method 3: secedit policy override then New-LocalUser
           if (-not $created) {
-            Write-Host "Trying wmic..."
-            wmic useraccount create name="$u",password="$p",PasswordExpires=false 2>&1 | ForEach-Object { Write-Host $_ }
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "Created via wmic"
+            Write-Host "Applying secedit policy override..."
+            $inf = @"
+[Unicode]
+Unicode=yes
+[System Access]
+MinimumPasswordLength = 0
+PasswordComplexity = 0
+PasswordHistorySize = 0
+MaximumPasswordAge = -1
+MinimumPasswordAge = 0
+[Version]
+signature="`$CHICAGO`$"
+Revision=1
+"@
+            $infPath = "$env:TEMP\pwpol.inf"
+            $dbPath  = "$env:TEMP\pwpol.sdb"
+            $inf | Out-File -Encoding Unicode $infPath
+            secedit /configure /db $dbPath /cfg $infPath /areas SECURITYPOLICY 2>&1 | ForEach-Object { Write-Host $_ }
+            gpupdate /force 2>&1 | Out-Null
+            Start-Sleep -Seconds 2
+
+            try {
+              $sec = ConvertTo-SecureString $p -AsPlainText -Force
+              New-LocalUser -Name $u -Password $sec -PasswordNeverExpires -AccountNeverExpires -ErrorAction Stop
+              Write-Host "[OK] Created via New-LocalUser after secedit"
               $created = $true
+            } catch {
+              Write-Warning "New-LocalUser still failed: $_"
             }
           }
 
           if (-not $created) {
-            Write-Error "FAILED to create user $u with all methods"
+            Write-Error "FAILED to create user $u with all 3 methods"
             exit 1
           }
 
-          # 4. Verify user exists
+          # Verify
           $verify = Get-LocalUser -Name $u -ErrorAction SilentlyContinue
           if (-not $verify) {
             Write-Error "User $u not found after creation"
             exit 1
           }
-          Write-Host "User $u verified: enabled=$($verify.Enabled)"
+          Write-Host "[OK] User $u verified — enabled=$($verify.Enabled)"
 
-          # 5. Enable + groups
+          # Enable + groups
           Enable-LocalUser -Name $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group Administrators -Member $u -ErrorAction SilentlyContinue
           Add-LocalGroupMember -Group "Remote Desktop Users" -Member $u -ErrorAction SilentlyContinue
+          Write-Host "[OK] User $u added to Administrators + Remote Desktop Users"
 
-          # 6. Password never expires
+          # Password never expires
           wmic useraccount where "name='$u'" set PasswordExpires=false 2>$null | Out-Null
 
-          # 7. Enable RDP
+          # Enable RDP
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-          # 8. Disable NLA (Network Level Authentication) — fixes some RDP auth issues
+          # Disable NLA
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp" -Name UserAuthentication -Value 0 -ErrorAction SilentlyContinue
 
-          # 9. Verify RDP enabled
           $deny = (Get-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server").fDenyTSConnections
-          Write-Host "fDenyTSConnections=$deny (0 = RDP enabled)"
-
-          Write-Host "RDP user $u ready — password length: $($p.Length) chars"
+          Write-Host "[OK] fDenyTSConnections=$deny (0 = RDP enabled)"
+          Write-Host "=== RDP ready: user=$u passLen=$($p.Length) ==="
 
       - name: Startup purge (devices containing 'bullet')
         run: |
@@ -318,12 +345,9 @@ jobs:
               -Headers @{ Authorization = "Bearer $token"; Accept = "application/vnd.github+json" } `
               -Body $body `
               -ErrorAction Stop
-            Write-Host "Dispatch OK"
+            Write-Host "[OK] Dispatch B successful"
           } catch {
             Write-Error "Dispatch failed: $($_.Exception.Message)"
-            if ($_.ErrorDetails.Message) {
-              Write-Host "Response body:"
-              Write-Host $_.ErrorDetails.Message
-            }
+            if ($_.ErrorDetails.Message) { Write-Host $_.ErrorDetails.Message }
             exit 1
           }
