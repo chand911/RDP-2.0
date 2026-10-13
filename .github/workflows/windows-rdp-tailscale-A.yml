@@ -1,30 +1,30 @@
-name: Windows RDP via Tailscale (A)
+name: Windows RDP via Tailscale (B)
 
 on:
   workflow_dispatch:
     inputs:
       ts_tailnet:
-        description: "Tailscale tailnet (e.g. you@gmail.com)"
+        description: "Tailscale tailnet"
         required: true
       ts_api_key:
-        description: "Tailscale API key (device admin, no 'Bearer')"
+        description: "Tailscale API key"
         required: true
       ts_authkey:
-        description: "Tailscale auth key (reusable or ephemeral)"
+        description: "Tailscale auth key"
         required: true
       gh_api_token:
-        description: "GitHub Personal Access Token (classic; scopes: repo, workflow)"
+        description: "GitHub PAT"
         required: true
       test_mode:
-        description: "Run 5-minute test loop"
+        description: "5-minute test"
         type: boolean
         default: false
       runtime_minutes:
-        description: "Runtime in minutes (max 360; capped to 355)"
+        description: "Runtime in minutes"
         required: false
         default: "355"
       loops:
-        description: "How many handoffs (0 = infinite)"
+        description: "0 = infinite"
         required: false
         default: "0"
 
@@ -41,8 +41,8 @@ defaults:
     shell: pwsh
 
 env:
-  RDP_USER: Bullettemporary
-  RDP_PASS: Bullet@12345
+  RDP_USER: chand
+  RDP_PASS: 1
   TS_HOSTNAME: bullet
 
 jobs:
@@ -50,16 +50,16 @@ jobs:
     runs-on: windows-2022
     timeout-minutes: 370
     steps:
-      - name: 🔧 Resolve inputs (safe)
+      - name: Resolve inputs
         id: cfg
         env:
-          RAW_TAILNET:  ${{ inputs.ts_tailnet }}
-          RAW_APIKEY:   ${{ inputs.ts_api_key }}
-          RAW_AUTHKEY:  ${{ inputs.ts_authkey }}
-          RAW_PAT:      ${{ inputs.gh_api_token }}
-          RAW_TEST:     ${{ inputs.test_mode == true && 'true' || 'false' }}
-          RAW_RUNTIME:  ${{ inputs.runtime_minutes || '355' }}
-          RAW_LOOPS:    ${{ inputs.loops || '0' }}
+          RAW_TAILNET: ${{ inputs.ts_tailnet }}
+          RAW_APIKEY:  ${{ inputs.ts_api_key }}
+          RAW_AUTHKEY: ${{ inputs.ts_authkey }}
+          RAW_PAT:     ${{ inputs.gh_api_token }}
+          RAW_TEST:    ${{ inputs.test_mode == true && 'true' || 'false' }}
+          RAW_RUNTIME: ${{ inputs.runtime_minutes || '355' }}
+          RAW_LOOPS:   ${{ inputs.loops || '0' }}
         run: |
           function ToIntOr($v, $def){ if("$v" -match '^\d+$'){[int]$v}else{[int]$def} }
 
@@ -71,15 +71,11 @@ jobs:
             Write-Error "Missing required inputs"; exit 1
           }
 
-          # Robust boolean
           $isTest = ($env:RAW_TEST -match '^(?i:true|1|yes|on)$')
-
           $runtime = ToIntOr $env:RAW_RUNTIME 355
           if ($isTest) { $runtime = 5 }
-
-          # Ensure ~6h (355) when test_mode is off and value is too small
-          if (-not $isTest -and $runtime -lt 6) { $runtime = 355 }
           if ($runtime -gt 360) { $runtime = 355 }
+          if ($runtime -lt 1)    { $runtime = 355 }
 
           $loops = ToIntOr $env:RAW_LOOPS 0
           if ($loops -lt 0) { $loops = 0 }
@@ -90,9 +86,9 @@ jobs:
           "pat=$pat"         | Out-File -Append $env:GITHUB_OUTPUT
           "runtime=$runtime" | Out-File -Append $env:GITHUB_OUTPUT
           "loops=$loops"     | Out-File -Append $env:GITHUB_OUTPUT
-          Write-Host "Resolved: test=$isTest, runtime=$runtime, loops=$loops"
+          "started=$(Get-Date -Format o)" | Out-File -Append $env:GITHUB_OUTPUT
 
-      - name: ⚙️ Install Tailscale (if missing) & show version
+      - name: Install Tailscale
         run: |
           $exe = "C:\Program Files\Tailscale\tailscale.exe"
           if (-not (Test-Path $exe)) {
@@ -104,7 +100,7 @@ jobs:
           Start-Service Tailscale -ErrorAction SilentlyContinue
           & "C:\Program Files\Tailscale\tailscale.exe" version
 
-      - name: 🔐 Enable RDP user + firewall
+      - name: Enable RDP user + firewall
         run: |
           $u="${{ env.RDP_USER }}"; $p="${{ env.RDP_PASS }}"
           $sec = ConvertTo-SecureString $p -AsPlainText -Force
@@ -119,7 +115,7 @@ jobs:
           Set-ItemProperty "HKLM:\System\CurrentControlSet\Control\Terminal Server" -Name fDenyTSConnections -Value 0
           Enable-NetFirewallRule -DisplayGroup "Remote Desktop" | Out-Null
 
-      - name: 🧹 PURGE any devices containing 'bullet' (startup)
+      - name: Startup purge
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
           $tn  = [uri]::EscapeDataString("${{ steps.cfg.outputs.tailnet }}")
@@ -138,15 +134,16 @@ jobs:
             }
           } catch { Write-Warning "Startup purge failed: $_" }
 
-      - name: 🔗 Tailscale up (hostname=bullet) + show IP/FQDN/DERP
+      - name: Tailscale up
         id: up
         run: |
           $ts = "C:\Program Files\Tailscale\tailscale.exe"
           & $ts logout | Out-Null
           & $ts up --authkey "${{ steps.cfg.outputs.authkey }}" --hostname "${{ env.TS_HOSTNAME }}" --accept-routes --accept-dns=false
-          Start-Sleep -Seconds 2
+          Start-Sleep -Seconds 3
 
           $ip4 = (& $ts ip -4 | Select-Object -First 1)
+          if (-not $ip4) { Write-Error "Tailscale failed to get IP"; exit 1 }
           $status = & $ts status --json | ConvertFrom-Json
           $fqdn = $status.Self.DNSName
           $derp = $status.Self.DERP
@@ -154,9 +151,17 @@ jobs:
           "fqdn=$fqdn" | Out-File -Append $env:GITHUB_OUTPUT
           "derp=$derp" | Out-File -Append $env:GITHUB_OUTPUT
 
-          "### RDP (A)`nHost: $env:TS_HOSTNAME`nIPv4: $ip4`nMagicDNS: $fqdn`nDERP: $derp`nUser: $env:RDP_USER`nPass: $env:RDP_PASS" | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
+          @"
+          ### RDP (B) — ${{ steps.cfg.outputs.started }}
+          Host: $env:TS_HOSTNAME
+          IPv4: $ip4
+          MagicDNS: $fqdn
+          DERP: $derp
+          User: $env:RDP_USER
+          Pass: $env:RDP_PASS
+          "@ | Out-File $env:GITHUB_STEP_SUMMARY -Append -Encoding utf8
 
-      - name: ⏳ Keep alive
+      - name: Keep alive
         run: |
           $mins=[int]"${{ steps.cfg.outputs.runtime }}"
           $end=(Get-Date).AddMinutes($mins)
@@ -166,7 +171,7 @@ jobs:
             Start-Sleep -Seconds 60
           }
 
-      - name: 🧹 PURGE any devices containing 'bullet' (exit)
+      - name: Exit purge
         if: always()
         run: |
           $hdr = @{ Authorization = "Bearer ${{ steps.cfg.outputs.apikey }}" }
@@ -186,7 +191,7 @@ jobs:
             }
           } catch { Write-Warning "Exit purge failed: $_" }
 
-      - name: 🔁 Dispatch workflow B (instant, forever by default)
+      - name: Dispatch workflow A
         if: always()
         run: |
           $loops=[int]"${{ steps.cfg.outputs.loops }}"
@@ -207,7 +212,8 @@ jobs:
             }
           } | ConvertTo-Json -Depth 5
 
+          Write-Host "Dispatching A (next loops=$next)..."
           Invoke-RestMethod -Method POST `
-            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-B.yml/dispatches" `
+            -Uri "https://api.github.com/repos/${{ github.repository }}/actions/workflows/windows-rdp-tailscale-A.yml/dispatches" `
             -Headers @{ Authorization = "Bearer $token"; "Accept"="application/vnd.github+json" } `
             -Body $body
